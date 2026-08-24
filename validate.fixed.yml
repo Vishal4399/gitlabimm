@@ -1,0 +1,183 @@
+# ---------------------------------------------------------------------------
+# Deployment folder immutability validation — corrected.
+#
+# Keeps your structure (MR arm + default-branch arm). Six fixes, each marked
+# FIX n in the comments below.
+# ---------------------------------------------------------------------------
+
+validate_deployment_tags:
+  stage: validate
+
+  variables:
+    # Fetch full history instead of a shallow clone.
+    GIT_DEPTH: 0
+    DEPLOY_DIR: "oncloud/deployment"
+    # FIX 6: files that can switch this check off. Editing one of these in the
+    # same MR that touches DEPLOY_DIR is refused, because MR pipelines run the
+    # config from the SOURCE branch.
+    GUARD_FILES: ".gitlab-ci.yml validate.yml"
+
+  rules:
+    # Primary governance control — merge requests.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Defence in depth — default branch.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+  script:
+    - |
+      set -euo pipefail
+
+      fail() { echo; echo "FATAL: $*" >&2; exit 1; }
+
+      echo "=================================================="
+      echo "Checking deployment folder immutability"
+      echo "=================================================="
+
+      HEAD_SHA="$(git rev-parse HEAD)"
+      BASE=""
+
+      #
+      # Merge request validation
+      #
+      if [ "${CI_PIPELINE_SOURCE}" = "merge_request_event" ]; then
+        TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+        echo "Pipeline Type : Merge Request"
+        echo "Target Branch : ${TARGET}"
+
+        git fetch --quiet origin "${TARGET}" \
+          || fail "could not fetch origin/${TARGET}."
+
+        # FIX 1 — THE BUG YOU HIT.
+        # Use FETCH_HEAD, never "origin/${TARGET}".
+        #
+        # "git fetch origin main" always writes FETCH_HEAD, but it only updates
+        # refs/remotes/origin/main when remote.origin.fetch maps it. GitLab
+        # runners fetch a narrow refspec for MR pipelines, so origin/main is
+        # frequently stale or absent. Your job log shows this directly:
+        #
+        #     * branch      main     -> FETCH_HEAD
+        #
+        # With a standard refspec git also prints a second line,
+        # "abc1234..def5678  main -> origin/main". Yours has no such line.
+        #
+        # A stale base predates the tag file, so merge-base lands before the
+        # file existed, and your MODIFICATION was reported as "A".
+        #
+        # Resolve FETCH_HEAD to a SHA immediately — any later fetch overwrites it.
+        TARGET_SHA="$(git rev-parse FETCH_HEAD)"
+
+        # FIX 2 — fail closed.
+        # Your version did "exit 0" when merge-base failed, so any broken or
+        # missing ref silently passed the whole check.
+        BASE="$(git merge-base "${TARGET_SHA}" "${HEAD_SHA}")" \
+          || fail "no merge base between ${TARGET} and this branch. Confirm GIT_DEPTH: 0 is in effect and that no project-level GIT_DEPTH variable overrides it."
+
+      #
+      # Default branch validation
+      #
+      elif [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH}" ]; then
+        echo "Pipeline Type : Default Branch"
+
+        if [ "${CI_COMMIT_BEFORE_SHA}" = "0000000000000000000000000000000000000000" ]; then
+          echo "Initial commit detected. Skipping immutability validation."
+          exit 0
+        fi
+
+        git cat-file -e "${CI_COMMIT_BEFORE_SHA}^{commit}" 2>/dev/null \
+          || fail "previous commit ${CI_COMMIT_BEFORE_SHA} is not in this clone."
+        BASE="${CI_COMMIT_BEFORE_SHA}"
+
+      #
+      # FIX 3 — never fall through with BASE unset.
+      # Your version left CHANGED_FILES unset here, which "${CHANGED_FILES:-}"
+      # then treated as "no changes" and passed.
+      #
+      else
+        fail "unexpected pipeline context (source=${CI_PIPELINE_SOURCE}, branch=${CI_COMMIT_BRANCH:-none})."
+      fi
+
+      echo "Base Commit   : ${BASE}"
+      echo "Head Commit   : ${HEAD_SHA}"
+      echo ""
+
+      #
+      # FIX 6 — guard-file tampering
+      #
+      TOUCHED_DEPLOY="$(git diff --name-only "${BASE}" "${HEAD_SHA}" -- "${DEPLOY_DIR}")"
+      TOUCHED_GUARD=""
+      for GF in ${GUARD_FILES}; do
+        if [ -n "$(git diff --name-only "${BASE}" "${HEAD_SHA}" -- "${GF}")" ]; then
+          TOUCHED_GUARD="${TOUCHED_GUARD} ${GF}"
+        fi
+      done
+      if [ -n "${TOUCHED_GUARD}" ] && [ -n "${TOUCHED_DEPLOY}" ]; then
+        echo "=================================================="
+        echo "REFUSED: pipeline config and deployment files in one change"
+        echo "=================================================="
+        echo ""
+        echo "Changed:${TOUCHED_GUARD}"
+        echo "        files under ${DEPLOY_DIR}/"
+        echo ""
+        echo "Merge request pipelines run the config from the source branch, so"
+        echo "a config change could disable this check in the same commit that"
+        echo "edits a deployment tag. Split them into two merge requests."
+        exit 1
+      fi
+
+      #
+      # Collect changes
+      #
+      CHANGED_FILES="$(git diff --name-status --find-renames \
+        "${BASE}" "${HEAD_SHA}" -- "${DEPLOY_DIR}")"
+
+      echo "Changed deployment files:"
+      echo "${CHANGED_FILES:-None}"
+
+      if [ -z "${CHANGED_FILES}" ]; then
+        echo ""
+        echo "No deployment folder changes detected."
+        exit 0
+      fi
+
+      # FIX 4 — allow-list instead of a block-list.
+      # "grep -E '^(M|D|R)'" silently permitted T (type change, e.g. replacing
+      # a tag file with a symlink) and C (copy). Inverting the test so that
+      # ONLY "A" passes closes those and any status git adds in future.
+      #
+      # FIX 5 — grep -q, so raw matches do not print before the formatted
+      # message. "|| true" keeps a no-match exit from tripping set -e.
+      VIOLATIONS="$(echo "${CHANGED_FILES}" | grep -vE '^A' || true)"
+
+      if [ -n "${VIOLATIONS}" ]; then
+        echo ""
+        echo "=================================================="
+        echo "IMMUTABILITY VIOLATION DETECTED"
+        echo "=================================================="
+        echo ""
+        echo "Deployment tags are immutable release artifacts."
+        echo ""
+        echo "Detected Changes:"
+        echo "${VIOLATIONS}"
+        echo ""
+        echo "Allowed:"
+        echo "  A   Add deployment_tag_YYYYMMDD.txt"
+        echo "      or deployment_tag_YYYYMMDD_<extended_name>.txt"
+        echo ""
+        echo "Not Allowed:"
+        echo "  M   Modify an existing deployment tag"
+        echo "  D   Delete an existing deployment tag"
+        echo "  R   Rename an existing deployment tag"
+        echo "  T   Replace a deployment tag with a symlink"
+        echo "  C   Copy over an existing deployment tag"
+        echo ""
+        echo "Resolution:"
+        echo "  Create a new deployment_tag_YYYYMMDD.txt instead of modifying"
+        echo "  an existing deployment tag."
+        exit 1
+      fi
+
+      echo ""
+      echo "Deployment folder immutability validation passed."
+
+  interruptible: true

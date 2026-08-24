@@ -1,170 +1,226 @@
 # ---------------------------------------------------------------------------
-# Deployment folder immutability validation — corrected.
+# Deployment folder immutability validation.
 #
-# Keeps your structure (MR arm + default-branch arm). Six fixes, each marked
-# FIX n in the comments below.
+# Rule: any file under DEPLOY_DIR that exists on the target branch must be
+# byte-identical in this branch. Only ADDING new files is permitted.
+#
+# v2 — closes two bypasses found by adversarial review of v1. See FIX A and
+# FIX B. Fails CLOSED: anything it cannot determine aborts the job.
 # ---------------------------------------------------------------------------
 
 validate_deployment_tags:
   stage: validate
 
   variables:
-    # Fetch full history instead of a shallow clone.
+    # Required. A shallow clone cannot see the history this job reads.
     GIT_DEPTH: 0
     DEPLOY_DIR: "oncloud/deployment"
-    # FIX 6: files that can switch this check off. Editing one of these in the
-    # same MR that touches DEPLOY_DIR is refused, because MR pipelines run the
-    # config from the SOURCE branch.
-    GUARD_FILES: ".gitlab-ci.yml validate.yml"
+    # Extra files that could switch this check off, space separated. The
+    # project's CI config path is added automatically below — list here any
+    # file pulled in via `include:`, e.g. "ci/validate.yml ci/deploy.yml".
+    GUARD_FILES: ""
 
   rules:
-    # Primary governance control — merge requests.
+    # Primary control — merge requests.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    # Defence in depth — default branch.
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # Defence in depth — pushes to the default branch. Restricted to `push`
+    # so scheduled, web and API pipelines do not enter an arm that has no
+    # previous commit to compare against.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - when: never
 
   script:
     - |
       set -euo pipefail
 
+      TAB="$(printf '\t')"
+      WORK="$(mktemp -d)"
+      trap 'rm -rf "$WORK"' EXIT
+
       fail() { echo; echo "FATAL: $*" >&2; exit 1; }
+
+      DEPLOY_DIR="${DEPLOY_DIR:-oncloud/deployment}"
+      # CI_CONFIG_PATH is set whenever the project uses a non-default config
+      # file. Guarding a hardcoded ".gitlab-ci.yml" silently protects nothing
+      # in that case.
+      GUARD_FILES="${GUARD_FILES:-} ${CI_CONFIG_PATH:-.gitlab-ci.yml}"
 
       echo "=================================================="
       echo "Checking deployment folder immutability"
       echo "=================================================="
 
       HEAD_SHA="$(git rev-parse HEAD)"
-      BASE=""
+      MODE=""
+      BASELINE=""
+      BASELINE_NAME=""
 
       #
-      # Merge request validation
+      # Merge request
       #
-      if [ "${CI_PIPELINE_SOURCE}" = "merge_request_event" ]; then
-        TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      if [ "${CI_PIPELINE_SOURCE:-}" = "merge_request_event" ]; then
+        MODE="mr"
+        TARGET="${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}"
+        [ -n "${TARGET}" ] \
+          || fail "CI_MERGE_REQUEST_TARGET_BRANCH_NAME is empty on a merge_request_event pipeline."
+
         echo "Pipeline Type : Merge Request"
         echo "Target Branch : ${TARGET}"
 
-        git fetch --quiet origin "${TARGET}" \
-          || fail "could not fetch origin/${TARGET}."
+        # FIX A — never write "git fetch origin ${TARGET}".
+        #
+        # Git resolves a partial ref name as refs/tags/<name> BEFORE
+        # refs/heads/<name>. Anyone able to push a tag can therefore create a
+        # tag literally named "main", and FETCH_HEAD then points wherever that
+        # tag points. Verified: the fetch prints
+        #     * tag        main    -> FETCH_HEAD
+        # instead of "* branch", the baseline moves to a commit that predates
+        # the file, and a modification is reported as an addition. GitLab
+        # protects no tags by default, so any Developer can do this and delete
+        # the tag once the pipeline is green.
+        #
+        # Naming refs/heads explicitly removes the ambiguity. Writing to the
+        # tracking ref in the same command also means we never read a stale
+        # origin/<branch> — which was the v1 bug.
+        git fetch --quiet --no-tags origin \
+          "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}" \
+          || fail "could not fetch refs/heads/${TARGET} from origin."
 
-        # FIX 1 — THE BUG YOU HIT.
-        # Use FETCH_HEAD, never "origin/${TARGET}".
-        #
-        # "git fetch origin main" always writes FETCH_HEAD, but it only updates
-        # refs/remotes/origin/main when remote.origin.fetch maps it. GitLab
-        # runners fetch a narrow refspec for MR pipelines, so origin/main is
-        # frequently stale or absent. Your job log shows this directly:
-        #
-        #     * branch      main     -> FETCH_HEAD
-        #
-        # With a standard refspec git also prints a second line,
-        # "abc1234..def5678  main -> origin/main". Yours has no such line.
-        #
-        # A stale base predates the tag file, so merge-base lands before the
-        # file existed, and your MODIFICATION was reported as "A".
-        #
-        # Resolve FETCH_HEAD to a SHA immediately — any later fetch overwrites it.
-        TARGET_SHA="$(git rev-parse FETCH_HEAD)"
-
-        # FIX 2 — fail closed.
-        # Your version did "exit 0" when merge-base failed, so any broken or
-        # missing ref silently passed the whole check.
-        BASE="$(git merge-base "${TARGET_SHA}" "${HEAD_SHA}")" \
-          || fail "no merge base between ${TARGET} and this branch. Confirm GIT_DEPTH: 0 is in effect and that no project-level GIT_DEPTH variable overrides it."
+        BASELINE="$(git rev-parse "refs/remotes/origin/${TARGET}")"
+        BASELINE_NAME="${TARGET}"
 
       #
-      # Default branch validation
+      # Default branch push
       #
-      elif [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH}" ]; then
-        echo "Pipeline Type : Default Branch"
+      elif [ "${CI_PIPELINE_SOURCE:-}" = "push" ] \
+        && [ -n "${CI_COMMIT_BRANCH:-}" ] \
+        && [ "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH:-}" ]; then
+        MODE="default"
+        echo "Pipeline Type : Push to ${CI_COMMIT_BRANCH}"
 
-        if [ "${CI_COMMIT_BEFORE_SHA}" = "0000000000000000000000000000000000000000" ]; then
-          echo "Initial commit detected. Skipping immutability validation."
+        BEFORE="${CI_COMMIT_BEFORE_SHA:-}"
+        [ -n "${BEFORE}" ] || fail "CI_COMMIT_BEFORE_SHA is not set on this push pipeline."
+
+        if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+          echo "No previous commit recorded for this push. Nothing to compare."
           exit 0
         fi
+        git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
+          || fail "previous commit ${BEFORE} is not in this clone. Confirm GIT_DEPTH: 0 is in effect."
 
-        git cat-file -e "${CI_COMMIT_BEFORE_SHA}^{commit}" 2>/dev/null \
-          || fail "previous commit ${CI_COMMIT_BEFORE_SHA} is not in this clone."
-        BASE="${CI_COMMIT_BEFORE_SHA}"
+        BASELINE="${BEFORE}"
+        BASELINE_NAME="previous ${CI_COMMIT_BRANCH} tip"
 
-      #
-      # FIX 3 — never fall through with BASE unset.
-      # Your version left CHANGED_FILES unset here, which "${CHANGED_FILES:-}"
-      # then treated as "no changes" and passed.
-      #
       else
-        fail "unexpected pipeline context (source=${CI_PIPELINE_SOURCE}, branch=${CI_COMMIT_BRANCH:-none})."
+        fail "unexpected pipeline context (source=${CI_PIPELINE_SOURCE:-unset}, branch=${CI_COMMIT_BRANCH:-unset})."
       fi
 
-      echo "Base Commit   : ${BASE}"
-      echo "Head Commit   : ${HEAD_SHA}"
+      echo "Baseline      : ${BASELINE}"
+      echo "Head          : ${HEAD_SHA}"
       echo ""
 
       #
-      # FIX 6 — guard-file tampering
+      # Guard-file tampering — merge requests only.
+      # On the default branch the merge has already happened, so refusing here
+      # would only turn the branch red for something nobody can now split into
+      # two merge requests.
       #
-      TOUCHED_DEPLOY="$(git diff --name-only "${BASE}" "${HEAD_SHA}" -- "${DEPLOY_DIR}")"
-      TOUCHED_GUARD=""
-      for GF in ${GUARD_FILES}; do
-        if [ -n "$(git diff --name-only "${BASE}" "${HEAD_SHA}" -- "${GF}")" ]; then
-          TOUCHED_GUARD="${TOUCHED_GUARD} ${GF}"
+      if [ "${MODE}" = "mr" ]; then
+        TOUCHED_DEPLOY="$(git diff --name-only "${BASELINE}" "${HEAD_SHA}" -- "${DEPLOY_DIR}")"
+        TOUCHED_GUARD=""
+        for GF in ${GUARD_FILES}; do
+          [ -n "${GF}" ] || continue
+          if [ -n "$(git diff --name-only "${BASELINE}" "${HEAD_SHA}" -- "${GF}")" ]; then
+            TOUCHED_GUARD="${TOUCHED_GUARD} ${GF}"
+          fi
+        done
+        if [ -n "${TOUCHED_GUARD}" ] && [ -n "${TOUCHED_DEPLOY}" ]; then
+          echo "=================================================="
+          echo "REFUSED: pipeline config and deployment files together"
+          echo "=================================================="
+          echo ""
+          echo "Changed:${TOUCHED_GUARD}"
+          echo "        files under ${DEPLOY_DIR}/"
+          echo ""
+          echo "Merge request pipelines run the config from the SOURCE branch,"
+          echo "so a config change could disable this check in the same commit"
+          echo "that edits a deployment tag. Split them into two merge requests."
+          exit 1
         fi
-      done
-      if [ -n "${TOUCHED_GUARD}" ] && [ -n "${TOUCHED_DEPLOY}" ]; then
-        echo "=================================================="
-        echo "REFUSED: pipeline config and deployment files in one change"
-        echo "=================================================="
-        echo ""
-        echo "Changed:${TOUCHED_GUARD}"
-        echo "        files under ${DEPLOY_DIR}/"
-        echo ""
-        echo "Merge request pipelines run the config from the source branch, so"
-        echo "a config change could disable this check in the same commit that"
-        echo "edits a deployment tag. Split them into two merge requests."
-        exit 1
       fi
 
       #
-      # Collect changes
+      # FIX B — compare against the target branch TIP, not a merge base.
       #
-      CHANGED_FILES="$(git diff --name-status --find-renames \
-        "${BASE}" "${HEAD_SHA}" -- "${DEPLOY_DIR}")"
+      # v1 asked "did this path exist at the merge base?". That is a different
+      # question from "does this path exist on the target branch", and the two
+      # diverge whenever more than one merge base exists. git merge-base prints
+      # only ONE of them, and in a criss-cross history — which this workflow
+      # produces naturally: a branch cut from main, another MR landing first,
+      # then a merge commit — it can return the base that predates the tag
+      # file. The mutation is then reported as an addition AND the merge
+      # applies cleanly, so it reaches the target branch.
+      #
+      # Diffing against the tip removes merge bases from the verdict entirely.
+      # The one case the tip alone cannot judge is D: a path on the target
+      # branch that is absent here. That is legitimate when it landed on the
+      # target after this branch was cut, and a violation when this branch
+      # removed it. rev-list answers that exactly — if this branch's history
+      # ever touched the path, this branch had it, so this branch removed it.
+      #
+      git diff --name-status --find-renames "${BASELINE}" "${HEAD_SHA}" \
+        -- "${DEPLOY_DIR}" > "${WORK}/raw" || fail "git diff failed."
 
-      echo "Changed deployment files:"
-      echo "${CHANGED_FILES:-None}"
+      : > "${WORK}/violations"
+      : > "${WORK}/added"
+      : > "${WORK}/incoming"
 
-      if [ -z "${CHANGED_FILES}" ]; then
+      while IFS="${TAB}" read -r ST P1 P2; do
+        [ -n "${ST:-}" ] || continue
+        case "${ST}" in
+          A*) echo "  A  ${P1}" >> "${WORK}/added" ;;
+          D*)
+            if [ -n "$(git rev-list --max-count=1 "${HEAD_SHA}" -- "${P1}")" ]; then
+              echo "  D  ${P1}  (deleted by this branch)" >> "${WORK}/violations"
+            else
+              echo "  .  ${P1}" >> "${WORK}/incoming"
+            fi
+            ;;
+          M*) echo "  M  ${P1}  (contents changed)"        >> "${WORK}/violations" ;;
+          R*) echo "  R  ${P1} -> ${P2}  (renamed)"        >> "${WORK}/violations" ;;
+          C*) echo "  C  ${P1} -> ${P2}  (copied over)"    >> "${WORK}/violations" ;;
+          T*) echo "  T  ${P1}  (file type changed)"       >> "${WORK}/violations" ;;
+          *)  echo "  ${ST} ${P1}  (unrecognised status)"  >> "${WORK}/violations" ;;
+        esac
+      done < "${WORK}/raw"
+
+      if [ -s "${WORK}/added" ]; then
+        echo "New deployment files added by this change:"
+        cat "${WORK}/added"
         echo ""
-        echo "No deployment folder changes detected."
-        exit 0
+      fi
+      if [ -s "${WORK}/incoming" ]; then
+        echo "Present on ${BASELINE_NAME} but not here — landed after this branch"
+        echo "was cut, the merge will bring them in. Not a violation:"
+        cat "${WORK}/incoming"
+        echo ""
       fi
 
-      # FIX 4 — allow-list instead of a block-list.
-      # "grep -E '^(M|D|R)'" silently permitted T (type change, e.g. replacing
-      # a tag file with a symlink) and C (copy). Inverting the test so that
-      # ONLY "A" passes closes those and any status git adds in future.
-      #
-      # FIX 5 — grep -q, so raw matches do not print before the formatted
-      # message. "|| true" keeps a no-match exit from tripping set -e.
-      VIOLATIONS="$(echo "${CHANGED_FILES}" | grep -vE '^A' || true)"
-
-      if [ -n "${VIOLATIONS}" ]; then
-        echo ""
+      if [ -s "${WORK}/violations" ]; then
         echo "=================================================="
         echo "IMMUTABILITY VIOLATION DETECTED"
         echo "=================================================="
         echo ""
-        echo "Deployment tags are immutable release artifacts."
+        echo "Deployment tags are immutable release artifacts. Files already on"
+        echo "${BASELINE_NAME} must stay byte-identical."
         echo ""
-        echo "Detected Changes:"
-        echo "${VIOLATIONS}"
+        echo "Detected changes:"
+        cat "${WORK}/violations"
         echo ""
         echo "Allowed:"
         echo "  A   Add deployment_tag_YYYYMMDD.txt"
         echo "      or deployment_tag_YYYYMMDD_<extended_name>.txt"
         echo ""
-        echo "Not Allowed:"
+        echo "Not allowed:"
         echo "  M   Modify an existing deployment tag"
         echo "  D   Delete an existing deployment tag"
         echo "  R   Rename an existing deployment tag"
@@ -172,12 +228,13 @@ validate_deployment_tags:
         echo "  C   Copy over an existing deployment tag"
         echo ""
         echo "Resolution:"
-        echo "  Create a new deployment_tag_YYYYMMDD.txt instead of modifying"
-        echo "  an existing deployment tag."
+        echo "  Create a new deployment_tag_YYYYMMDD.txt instead of changing an"
+        echo "  existing one. If you see M on a file you thought you were adding,"
+        echo "  someone else already merged that filename — pick a different"
+        echo "  date or suffix."
         exit 1
       fi
 
-      echo ""
       echo "Deployment folder immutability validation passed."
 
   interruptible: true

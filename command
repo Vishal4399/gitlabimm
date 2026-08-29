@@ -33,3 +33,6 @@ ssh -i "$HOME/.ssh/rsa_test" -o IdentitiesOnly=yes -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new "$(whoami)@localhost" 'whoami'
 
 grep -ri authorizedkeys /etc/ssh/sshd_config.d/ 2>/dev/null || echo NONE
+
+
+ls /etc/ssh/sshd_config.d/ && cat /etc/ssh/sshd_config.d/* >/dev/null 2>&1 && echo READABLE || echo UNREADABLE

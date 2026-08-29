@@ -22,3 +22,12 @@ awk '{print $3}' "$HOME/.ssh/authorized_keys"
 [ "$(getent passwd "$(whoami)" | cut -d: -f6)" = "$HOME" ] && echo SAME || echo DIFFERENT
 
 cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo NOFIPS
+
+
+ssh-keygen -t rsa -b 4096 -C "rsa-test" -f "$HOME/.ssh/rsa_test" -N ""
+
+cat "$HOME/.ssh/rsa_test.pub" >> "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+
+ssh -i "$HOME/.ssh/rsa_test" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new "$(whoami)@localhost" 'whoami'

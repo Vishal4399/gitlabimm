@@ -20,3 +20,5 @@ ssh -i "$HOME/.ssh/gitlab_batch_deploy" -o IdentitiesOnly=yes -o BatchMode=yes \
 awk '{print $3}' "$HOME/.ssh/authorized_keys"
 
 [ "$(getent passwd "$(whoami)" | cut -d: -f6)" = "$HOME" ] && echo SAME || echo DIFFERENT
+
+cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo NOFIPS

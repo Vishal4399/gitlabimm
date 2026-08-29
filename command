@@ -39,3 +39,6 @@ ls /etc/ssh/sshd_config.d/ && cat /etc/ssh/sshd_config.d/* >/dev/null 2>&1 && ec
 
 
 sss_ssh_authorizedkeys "$(whoami)"
+
+
+sudo sshd -T -C user=$(whoami),host=localhost,addr=127.0.0.1 | grep -Ei 'authorizedkeys|pubkeyauth'

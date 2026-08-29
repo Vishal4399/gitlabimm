@@ -16,3 +16,5 @@ ssh -i "$HOME/.ssh/gitlab_batch_deploy" -o IdentitiesOnly=yes -o BatchMode=yes \
 
 
 [ "$(ssh-keygen -y -f "$HOME/.ssh/gitlab_batch_deploy" | awk '{print $1,$2}')" = "$(awk '{print $1,$2}' "$HOME/.ssh/authorized_keys")" ] && echo MATCH || echo MISMATCH
+
+awk '{print $3}' "$HOME/.ssh/authorized_keys"

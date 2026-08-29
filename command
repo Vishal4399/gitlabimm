@@ -38,6 +38,19 @@ grep -ri authorizedkeys /etc/ssh/sshd_config.d/ 2>/dev/null || echo NONE
 ls /etc/ssh/sshd_config.d/ && cat /etc/ssh/sshd_config.d/* >/dev/null 2>&1 && echo READABLE || echo UNREADABLE
 
 
+
+# 1. Back up first
+sudo cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%F)
+
+# 2. Make your edits, then VALIDATE — this must print nothing
+sudo sshd -t
+
+# 3. Confirm the effective config is now what you want
+sudo sshd -T -C user=$(whoami),host=localhost,addr=127.0.0.1 | grep -i authorizedkeys
+
+# 4. Reload (not restart) — existing sessions survive
+sudo systemctl reload sshd
+
 grep -in -E 'authorizedkeys|pubkeyauth|allowusers|allowgroups|denyusers|denygroups|^match|^include' /etc/ssh/sshd_config
 
 

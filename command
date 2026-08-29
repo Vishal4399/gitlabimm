@@ -38,6 +38,9 @@ grep -ri authorizedkeys /etc/ssh/sshd_config.d/ 2>/dev/null || echo NONE
 ls /etc/ssh/sshd_config.d/ && cat /etc/ssh/sshd_config.d/* >/dev/null 2>&1 && echo READABLE || echo UNREADABLE
 
 
+grep -in -E 'authorizedkeys|pubkeyauth|allowusers|allowgroups|denyusers|denygroups|^match|^include' /etc/ssh/sshd_config
+
+
 sss_ssh_authorizedkeys "$(whoami)"
 
 

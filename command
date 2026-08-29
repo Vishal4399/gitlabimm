@@ -10,3 +10,6 @@ ssh -vvv -i "$K" -o IdentitiesOnly=yes -o BatchMode=yes \
 
 wc -c < "$HOME/.ssh/authorized_keys"
 ssh-keygen -lf "$HOME/.ssh/authorized_keys" 2>&1 | cut -c1-30
+
+ssh -i "$HOME/.ssh/gitlab_batch_deploy" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new "$(whoami)@localhost" 'whoami; hostname'

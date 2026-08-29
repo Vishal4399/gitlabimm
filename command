@@ -31,3 +31,5 @@ chmod 600 "$HOME/.ssh/authorized_keys"
 
 ssh -i "$HOME/.ssh/rsa_test" -o IdentitiesOnly=yes -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new "$(whoami)@localhost" 'whoami'
+
+grep -ri authorizedkeys /etc/ssh/sshd_config.d/ 2>/dev/null || echo NONE

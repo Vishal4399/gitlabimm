@@ -7,3 +7,6 @@ ssh -vvv -i "$K" -o IdentitiesOnly=yes -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new \
     "$(whoami)@localhost" true 2>&1 \
   | grep -Ei 'offering|send_pubkey|server accepts|authentications that can|no more auth|denied|invalid format|Trying private'
+
+wc -c < "$HOME/.ssh/authorized_keys"
+ssh-keygen -lf "$HOME/.ssh/authorized_keys" 2>&1 | cut -c1-30

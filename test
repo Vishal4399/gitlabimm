@@ -1,0 +1,19 @@
+stages:
+  - connectivity-check
+  # - deploy    # added in a later step
+
+verify-ssh-connection:
+  stage: connectivity-check
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+    - chmod 644 ~/.ssh/known_hosts
+    - echo "$SSH_PRIVATE_KEY_B64" | base64 -d > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+  script:
+    - ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=10
+        "$SSH_USER@$SSH_HOST" "echo 'GitLab CI reached dev-server as' \$(whoami) && hostname"
+  retry: 1
+  timeout: 2m

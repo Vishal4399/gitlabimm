@@ -1,0 +1,162 @@
+# ---------------------------------------------------------------------------
+# NEW JOB — add this to your existing .gitlab-ci.yml, alongside .ssh_template
+# and ssh_test (both left exactly as you already have them).
+#
+# The actual deploy logic (parsing the tag file, copying source -> dest)
+# lives in oncloud/deployment/deploy.sh, which is checked into this repo
+# and gets cloned down to the server along with everything else. This job
+# only does the minimum needed before that script can run: authenticate,
+# clone, invoke, clean up.
+#
+# Prerequisites to check in your real .gitlab-ci.yml before pasting this in:
+#   1. `stages:` must include a stage named "deploy" (or rename the `stage:`
+#      line below to match one you already have).
+#   2. The GitLab project setting "Limit access to this project" for CI/CD
+#      job tokens must allow this project to use its own CI_JOB_TOKEN to
+#      clone itself (this is the default, so usually nothing to change).
+#   3. If your on-prem GitLab uses a self-signed/internal CA, you'll need to
+#      make that CA trusted on the target server (or set GIT_SSL_CAINFO in
+#      the remote script below) — plain HTTPS clone will otherwise fail.
+# ---------------------------------------------------------------------------
+
+deploy_ssh:
+  stage: deploy
+
+  extends:
+    - .ssh_template
+    - .csm_blz_nonprod_ssh_credentials   # swap for the PROD credentials template when TARGET_ENV: "PROD"
+
+  variables:
+    TARGET_ENV: "DEV"
+    BLZ_USERNAME: "sysBUKCloudPlatformD"
+    SSH_HOST: "ldndsr02z04449.intranet.barcapint.com"
+    SSH_PORT: "22"
+    CHANGE_RECORD_NUMBER: ""
+    # Filename under oncloud/deployment/ in THIS repo, e.g. deployement_tag_20260901.txt
+    DEPLOYMENT_TAG: "deployement_tag_20260901.txt"
+    # Scratch directory on the remote server for the clone; removed
+    # automatically once deploy.sh finishes.
+    REMOTE_WORKSPACE: "/tmp/ci_deploy_${CI_PIPELINE_ID}"
+
+  when: manual
+  allow_failure: false
+
+  script:
+    - |
+      set -euo pipefail
+
+      if [ -z "${BLZ_USERNAME:-}" ]; then
+        echo "ERROR: BLZ_USERNAME is unavailable."
+        exit 1
+      fi
+
+      if [ -z "${SSH_HOST:-}" ]; then
+        echo "ERROR: SSH_HOST is unavailable."
+        exit 1
+      fi
+
+      if [ -z "${DEPLOYMENT_TAG:-}" ]; then
+        echo "ERROR: DEPLOYMENT_TAG is unavailable."
+        echo "Set it to the filename under oncloud/deployment/ that lists what to deploy."
+        exit 1
+      fi
+
+      if [ -z "${CI_JOB_TOKEN:-}" ]; then
+        echo "ERROR: CI_JOB_TOKEN is unavailable in this job context."
+        exit 1
+      fi
+
+      echo "======================================"
+      echo "Cloning repo on remote host and deploying"
+      echo "======================================"
+      echo "SSH user        : ${BLZ_USERNAME}"
+      echo "SSH host        : ${SSH_HOST}"
+      echo "SSH port        : ${SSH_PORT}"
+      echo "Deployment tag  : ${DEPLOYMENT_TAG}"
+      echo ""
+
+      if ! command -v sshpass >/dev/null 2>&1; then
+        echo "sshpass not found. Attempting to install..."
+        if command -v yum >/dev/null 2>&1; then
+          yum install -y sshpass
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update && apt-get install -y sshpass
+        else
+          echo "ERROR: Cannot install sshpass. Package manager not found."
+          exit 1
+        fi
+      fi
+
+      if [ -z "${!BLZ_USERNAME:-}" ]; then
+        echo "ERROR: No password credential was found for ${BLZ_USERNAME}."
+        echo "Expected a CI/CD variable whose name matches the BLZ_USERNAME value."
+        exit 1
+      fi
+
+      SSHPASS="${!BLZ_USERNAME}"
+      export SSHPASS
+
+      # ----------------------------------------------------------------
+      # Bootstrap script that runs ON THE REMOTE SERVER. It only
+      # authenticates, clones, and hands off to deploy.sh (which comes
+      # down as part of the clone) — no deploy logic lives here.
+      #
+      # This heredoc is UNQUOTED, so ${CI_SERVER_HOST}, ${CI_PROJECT_PATH},
+      # ${CI_JOB_TOKEN}, ${DEPLOYMENT_TAG} and ${REMOTE_WORKSPACE} are
+      # substituted HERE, by the runner's shell, right now. Every other
+      # variable reference is escaped as \${...} on purpose, so it stays
+      # literal in the generated file and is only evaluated later, by
+      # bash running on the remote server.
+      #
+      # Piping this whole script over SSH stdin (rather than passing the
+      # token as part of an ssh/git command line) keeps CI_JOB_TOKEN out
+      # of the remote host's process list (`ps`).
+      # ----------------------------------------------------------------
+      REMOTE_SCRIPT="$(mktemp)"
+      trap 'rm -f "${REMOTE_SCRIPT}"' EXIT
+
+      cat > "${REMOTE_SCRIPT}" <<REMOTE_EOF
+      set -euo pipefail
+
+      WORKSPACE="${REMOTE_WORKSPACE}"
+      REPO_DIR="\${WORKSPACE}/repo"
+
+      rm -rf "\${WORKSPACE}"
+      mkdir -p "\${WORKSPACE}"
+
+      cleanup_netrc() {
+        rm -f "\${WORKSPACE}/.netrc"
+      }
+      trap cleanup_netrc EXIT
+
+      printf 'machine %s\nlogin gitlab-ci-token\npassword %s\n' \
+        "${CI_SERVER_HOST}" "${CI_JOB_TOKEN}" > "\${WORKSPACE}/.netrc"
+      chmod 600 "\${WORKSPACE}/.netrc"
+
+      # git (via libcurl) picks up credentials from \$HOME/.netrc, so the
+      # token never appears in the clone URL or in this script's argv.
+      export HOME="\${WORKSPACE}"
+
+      echo "Cloning ${CI_PROJECT_PATH} into \${REPO_DIR} ..."
+      git clone --depth 1 "https://${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "\${REPO_DIR}"
+
+      chmod +x "\${REPO_DIR}/oncloud/deployment/deploy.sh"
+      bash "\${REPO_DIR}/oncloud/deployment/deploy.sh" "${DEPLOYMENT_TAG}"
+
+      rm -rf "\${WORKSPACE}"
+      echo "Temporary clone removed. Deployment complete."
+      REMOTE_EOF
+
+      echo "Connecting and running remote deployment script..."
+      sshpass -e ssh \
+        -p "${SSH_PORT}" \
+        -o BatchMode=no \
+        -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=no \
+        -o PreferredAuthentications=password,keyboard-interactive \
+        -o PubkeyAuthentication=no \
+        "${BLZ_USERNAME}@${SSH_HOST}" \
+        'bash -s' < "${REMOTE_SCRIPT}"
+
+      rm -f "${REMOTE_SCRIPT}"
+      echo "Remote deployment finished successfully."
